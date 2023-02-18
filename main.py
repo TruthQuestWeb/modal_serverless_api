@@ -15,10 +15,11 @@ web_app = FastAPI()
 
 image = (
     modal.Image.debian_slim()
+    .apt_install("curl")
     .run_commands(
         "apt-get update",
     )
-    .pip_install("bs4", "youdotcom", "requests")
+    .pip_install("bs4", "youdotcom", "requests", "openai")
 )
 
 stub = modal.Stub("modal-serverless-api", image=image)
@@ -55,6 +56,40 @@ def search_youdotcom(url):
     parsed = json.loads(search_results["results"])
     print(json.dumps(parsed, indent=4))
 
+@stub.function(secret=modal.Secret.from_name("modal_serverless_api_secrets"))
+def summarizer(url):
+    import os
+    import openai
+    import requests
+    import json
+    from bs4 import BeautifulSoup
+    import time
+
+    API_KEY = os.environ["GOOGLE_API_KEY"]
+    ENGINE_ID = os.environ["ENGINE_ID"]
+
+    # Get the article text and title from the URL
+    article_response = requests.get(url)
+    soup = BeautifulSoup(article_response.text, "html.parser")
+    article = soup.get_text(" ", strip=True)
+
+    title = soup.find("title").text 
+
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+
+    response = openai.Completion.create(
+    model="text-davinci-003",
+    prompt= article + "\n\n Remove opinion and summarize the article.",
+    temperature=0.36,
+    max_tokens=200,
+    top_p=1,
+    frequency_penalty=0,
+    presence_penalty=1
+    )
+
+    print(response)
+
+    return jsonable_encoder(response)
 
 @stub.function(secret=modal.Secret.from_name("modal_serverless_api_secrets"))
 def search_initial_article(url):
@@ -72,6 +107,9 @@ def search_initial_article(url):
     article_response = requests.get(url)
     soup = BeautifulSoup(article_response.text, "html.parser")
     article = soup.get_text(" ", strip=True)
+
+    #Get the author of the article
+    author = soup.find("meta", property="article:author")   
 
     title = soup.find("title").text
 
@@ -111,6 +149,10 @@ def search_initial_article(url):
 @web_app.post("/search/")
 async def search(url: URL):
     return search_initial_article.call(url.url_link)
+
+@web_app.post("/summarize/")
+async def summarize(url: URL):
+    return summarizer.call(url.url_link)
 
 
 @stub.asgi(image=image)
