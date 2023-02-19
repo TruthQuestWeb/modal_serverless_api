@@ -176,8 +176,46 @@ def foo(articles):
         return jsonable_encoder({"result": "false"})
 
 
+class Article(BaseModel):
+    text: str
+
+@stub.function(memory=4048, cpu=4.0)
+def confidence(articles):
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.model_selection import train_test_split
+    from sklearn.naive_bayes import MultinomialNB
+
+    import pandas as pd
+    df = pd.read_csv('/train.csv')
+
+    import numpy as np
+    df[['title', 'author']].replace('', np.nan, inplace=True)
+
+    df.dropna(subset=['title'], inplace=True)
+    df.dropna(subset=['author'], inplace=True)
+
+    df['content'] = df['author'] + ' ' + df['title']
+
+    X_train, X_test, y_train, y_test = train_test_split(df.content, df.label, test_size=.2)
+
+    count_vectorizer = CountVectorizer(stop_words='english')
+    count_train = count_vectorizer.fit_transform(X_train)
+
+    nb_classifier = MultinomialNB()
+    nb_classifier.fit(count_train, y_train)
+
+    df = pd.DataFrame([articles ])
+    input = count_vectorizer.transform(df)
+    pred = nb_classifier.predict_proba(input)
+    return jsonable_encoder({'true': pred[0][1], 'false': pred[0][0]})
+
+@web_app.post("/analysis/")
+async def analysis(articleobj: Article):
+    return confidence.call(articleobj.text)
+
+
 @stub.function(
-    secret=modal.Secret.from_name("modal_serverless_api_secrets"), memory=4048
+    secret=modal.Secret.from_name("modal_serverless_api_secrets"), memory=12288, cpu=6.0
 )
 def search_initial_article(url):
     import requests
@@ -212,11 +250,15 @@ def search_initial_article(url):
     results = response.json()["items"]
 
     comparison_articles = {}
-    comparison_articles["text"] = article
+    comparison_articles["title"] = title
+    comparison_articles["author"] = author
 
-    result = foo.call(comparison_articles["text"])
+    #result = foo.call(comparison_articles["text"])
 
-    return jsonable_encoder(result)
+    confi = confidence.call(comparison_articles)
+    #merged_data = {**result, **confi}
+
+    return jsonable_encoder(confi)
 
 
 """
