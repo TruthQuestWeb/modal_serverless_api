@@ -7,22 +7,44 @@ from fastapi.encoders import jsonable_encoder
 from typing import Optional
 
 from fastapi import FastAPI, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import modal
 
 web_app = FastAPI()
 
+
+origins = ["*"]
+
+web_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 image = (
     modal.Image.debian_slim()
     .apt_install("curl")
     .run_commands(
         "apt-get update",
+        "curl -O https://raw.githubusercontent.com/TruthQuestWeb/ml-model/main/train.csv",
     )
-    .pip_install("bs4", "youdotcom", "requests", "openai")
+    .pip_install(
+        "bs4", "youdotcom", "requests", "openai", "pandas", "scikit-learn", "numpy"
+    )
 )
 
+# Define the filename and path to save the pickled classifier
+filename = "classifier.pickle"
+volume = modal.SharedVolume().persist("model-cache-vol")
+
 stub = modal.Stub("modal-serverless-api", image=image)
+# 1 day duration
+CACHE_DURATION = 86400
+CACHE_DIR = "/cache"
 
 
 class URL(BaseModel):
@@ -56,6 +78,7 @@ def search_youdotcom(url):
     parsed = json.loads(search_results["results"])
     print(json.dumps(parsed, indent=4))
 
+
 @stub.function(secret=modal.Secret.from_name("modal_serverless_api_secrets"))
 def summarizer(url):
     import os
@@ -73,27 +96,90 @@ def summarizer(url):
     soup = BeautifulSoup(article_response.text, "html.parser")
     article = soup.get_text(" ", strip=True)
 
-    title = soup.find("title").text 
+    title = soup.find("title").text
 
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
     response = openai.Completion.create(
-    model="text-davinci-003",
-    prompt= article + "\n\n Remove opinion and summarize the article.",
-    temperature=0.36,
-    max_tokens=200,
-    top_p=1,
-    frequency_penalty=0,
-    presence_penalty=1
+        model="text-davinci-003",
+        prompt=article + "\n\n Remove opinion and summarize the article.",
+        temperature=0.36,
+        max_tokens=200,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=1,
     )
 
     print(response)
 
     return jsonable_encoder(response)
 
-@stub.function(secret=modal.Secret.from_name("modal_serverless_api_secrets"))
-def search_initial_article(url):
 
+@stub.function(memory=4048)
+def foo(articles):
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.model_selection import train_test_split
+    from sklearn.naive_bayes import MultinomialNB
+    from sklearn import metrics
+
+    import pickle
+    import pandas as pd
+    import time
+
+    df = pd.read_csv("/train.csv")
+
+    import numpy as np
+
+    # Check if the pickled file exists and if it has not expired
+    try:
+        with open(filename, "rb") as f:
+            classifier, cache_time = pickle.load(f)
+            if time.time() - cache_time < CACHE_DURATION:
+                df = pd.DataFrame({"text": [articles]})
+                input = count_vectorizer.transform(df)
+
+                # Make predictions and return the results
+                pred = nb_classifier.predict(input)
+                if pred == 1:
+                    return jsonable_encoder({"result": "true"})
+                else:
+                    return jsonable_encoder({"result": "false"})
+
+    except FileNotFoundError:
+        pass
+
+    df["text"].replace("", np.nan, inplace=True)
+    df.dropna(subset=["text"], inplace=True)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        df.text, df.label, test_size=0.2
+    )
+
+    count_vectorizer = CountVectorizer(stop_words="english")
+    count_train = count_vectorizer.fit_transform(X_train)
+    count_test = count_vectorizer.transform(X_test)
+
+    nb_classifier = MultinomialNB()
+    nb_classifier.fit(count_train, y_train)
+
+    with open(filename, "wb") as f:
+        pickle.dump((nb_classifier, time.time()), f)
+
+    df = pd.DataFrame({"text": [articles]})
+    input = count_vectorizer.transform(df)
+
+    pred = nb_classifier.predict(input)
+    if pred == 1:
+        return jsonable_encoder({"result": "true"})
+    else:
+        return jsonable_encoder({"result": "false"})
+
+
+@stub.function(
+    secret=modal.Secret.from_name("modal_serverless_api_secrets"), memory=4048
+)
+def search_initial_article(url):
     import requests
     import os
     import json
@@ -108,8 +194,8 @@ def search_initial_article(url):
     soup = BeautifulSoup(article_response.text, "html.parser")
     article = soup.get_text(" ", strip=True)
 
-    #Get the author of the article
-    author = soup.find("meta", property="article:author")   
+    # Get the author of the article
+    author = soup.find("meta", property="article:author")
 
     title = soup.find("title").text
 
@@ -126,8 +212,14 @@ def search_initial_article(url):
     results = response.json()["items"]
 
     comparison_articles = {}
-    comparison_articles[url] = article
+    comparison_articles["text"] = article
 
+    result = foo.call(comparison_articles["text"])
+
+    return jsonable_encoder(result)
+
+
+"""
     sources = []
     sources.append(extract_source.call(url))
 
@@ -142,17 +234,24 @@ def search_initial_article(url):
             print("Comparison article:", result["link"])
 
     print(json.dumps(comparison_articles, indent=4))
-
-    return jsonable_encoder(comparison_articles)
+"""
 
 
 @web_app.post("/search/")
 async def search(url: URL):
-    return search_initial_article.call(url.url_link)
+    art = search_initial_article.call(url.url_link)
+
+    return jsonable_encoder(art)
+
 
 @web_app.post("/summarize/")
 async def summarize(url: URL):
     return summarizer.call(url.url_link)
+
+
+# @web_app.post("/video/")
+# async def video(url: URL):
+#   return search_youdotcom.call(url.url_link)
 
 
 @stub.asgi(image=image)
